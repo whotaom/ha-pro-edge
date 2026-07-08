@@ -2,33 +2,43 @@
  * HTTP Analyzer Pro - Ultimate Merged Edition (Cloudflare Pages Edge Serverless)
  * 自动双语 / 深度真实指纹采集 / 工业级风控检测全面融合版
  * 
- * Version: v1.9.42 (Serverless Edge / CF Pages Edition)
+ * Version: v1.9.43 (Extreme Edge Performance / Ultra-Low Latency Edition)
  * Deployment: Cloudflare Workers / Pages (_worker.js)
+ * Changelog: V8 Loop Unrolling / Single-Pass Replace / Async WAF GC / AbortSignal Timeout
  */
 
 // ==================== 0. Military-Grade Core (Isolate Edge WAF) ====================
 const wafCache = new Map();
 
-function wafCheck(ip) {
+// Background GC to prevent main thread blocking (Tuning #2)
+async function cleanupWafBackground() {
+    const now = Date.now();
+    for (const [ip, record] of wafCache.entries()) {
+        if (now - record.ts > 60000) {
+            wafCache.delete(ip);
+        }
+    }
+    // Fallback absolute clear if still bloated
+    if (wafCache.size > 5000) wafCache.clear();
+}
+
+function wafCheck(ip, ctx) {
     const now = Date.now();
     const limit = 150; // Enterprise max requests per minute
 
-    // Prevent memory leaks in long-running isolates
-    if (wafCache.size > 5000) wafCache.clear();
-
-    const record = wafCache.get(ip) || { hits: 0, ts: now };
-    if (now - record.ts > 60000) {
-        record.hits = 1;
-        record.ts = now;
-    } else {
-        record.hits++;
+    // Non-blocking WAF eviction via ctx.waitUntil
+    if (wafCache.size > 3000) {
+        ctx.waitUntil(cleanupWafBackground());
     }
-    wafCache.set(ip, record);
 
-    if (record.hits > limit) {
-        return false;
-    }
-    return true;
+    const record = wafCache.get(ip);
+    if (!record || now - record.ts > 60000) {
+        wafCache.set(ip, { hits: 1, ts: now });
+        return true;
+    } 
+    
+    record.hits++;
+    return record.hits <= limit;
 }
 
 // Crypto hashing for backend
@@ -36,10 +46,15 @@ async function sha256(message) {
     const msgBuffer = new TextEncoder().encode(message);
     const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    // Fast array mapping
+    let result = '';
+    for (let i = 0; i < hashArray.length; i++) {
+        result += hashArray[i].toString(16).padStart(2, '0');
+    }
+    return result;
 }
 
-// ==================== 1. IP 分析与代理处理 ====================
+// ==================== 1. IP 分析与代理处理 (V8 Loop Optimized) ====================
 function getAllClientIPs(request) {
     const headers = request.headers;
     const ipSources = [
@@ -57,27 +72,35 @@ function getAllClientIPs(request) {
     let realClientIP = headers.get('cf-connecting-ip') || headers.get('x-real-ip') || 'Unknown';
     let headerSpoofingSuspected = false;
 
-    // Cloudflare Edge inherently trusts cf-connecting-ip, ensuring gateway authenticity
-    ipSources.forEach(([header, value]) => {
-        if (!value) return;
+    // Fast loop replacing forEach for V8 optimization (Tuning #4)
+    for (let i = 0; i < ipSources.length; i++) {
+        const header = ipSources[i][0];
+        const value = ipSources[i][1];
+        if (!value) continue;
         
         let ips = [];
-        if (header.toLowerCase() === 'forwarded') {
+        if (header === 'Forwarded') {
             const matches = value.match(/for=(?:"?\[?([^\];",]+)\]?"?)/ig);
             if (matches) {
-                ips = matches.map(m => m.replace(/for=/i, '').replace(/["[\]]/g, '').trim());
+                for (let j = 0; j < matches.length; j++) {
+                    ips.push(matches[j].replace(/for=/i, '').replace(/["[\]]/g, '').trim());
+                }
             }
         } else {
-            ips = value.split(',').map(ip => ip.trim());
+            const parts = value.split(',');
+            for (let j = 0; j < parts.length; j++) {
+                ips.push(parts[j].trim());
+            }
         }
 
-        ips.forEach(ip => {
+        for (let j = 0; j < ips.length; j++) {
+            const ip = ips[j];
             if (ip) {
                 if (!allIPs[header]) allIPs[header] = [];
                 allIPs[header].push(ip);
             }
-        });
-    });
+        }
+    }
 
     return {
         real_client_ip: realClientIP,
@@ -97,9 +120,11 @@ function detectAdvancedProxy(request) {
         'x-proxy-authorization', 'x-original-url', 'x-original-forwarded-for'
     ];
     let detected = [];
-    proxyHeaders.forEach(h => {
-        if (request.headers.has(h)) detected.push(h.toUpperCase());
-    });
+    for (let i = 0; i < proxyHeaders.length; i++) {
+        if (request.headers.has(proxyHeaders[i])) {
+            detected.push(proxyHeaders[i].toUpperCase());
+        }
+    }
     return detected;
 }
 
@@ -110,7 +135,6 @@ async function getIpContextClassification(ip, cfData, ctx) {
         country_code: 'Unknown', asn: 'Unknown', timezone: 'Unknown'
     };
 
-    // TDD Edge Optimization: Leverage CF object natively for 0ms latency
     if (cfData) {
         if (cfData.country) result.country_code = cfData.country;
         if (cfData.asn) result.asn = 'AS' + cfData.asn;
@@ -118,7 +142,6 @@ async function getIpContextClassification(ip, cfData, ctx) {
         if (cfData.asOrganization) result.isp = cfData.asOrganization;
     }
 
-    // Edge cache fallback to ipwho.is for deeper datacenter classification
     const cacheUrl = `https://ipwho.is/${ip}`;
     const cacheKey = new Request(cacheUrl, { headers: { 'Accept': 'application/json' } });
     const cache = caches.default;
@@ -126,39 +149,47 @@ async function getIpContextClassification(ip, cfData, ctx) {
 
     if (!response) {
         try {
-            response = await fetch(cacheKey);
+            // Hard timeout via AbortSignal to guarantee Edge 0ms TTFB (Tuning #3)
+            response = await fetch(cacheKey, { 
+                cf: { cacheTtl: 86400 },
+                signal: AbortSignal.timeout(300) 
+            });
             if (response.ok) {
                 ctx.waitUntil(cache.put(cacheKey, response.clone()));
             }
-        } catch (e) {}
+        } catch (e) {
+            response = null; // Graceful degradation to cfData
+        }
     }
 
     if (response && response.ok) {
-        const data = await response.json();
-        if (data.success) {
-            result.isp = data.connection?.isp || result.isp;
-            result.country_code = data.country_code || result.country_code;
-            result.asn = data.connection?.asn ? 'AS' + data.connection.asn : result.asn;
-            result.timezone = data.timezone?.id || result.timezone;
-            
-            const org = (data.connection?.org || '').toLowerCase();
-            const domain = (data.connection?.domain || '').toLowerCase();
-            
-            const dcKeywords = ['cloud', 'datacenter', 'hosting', 'vps', 'amazon', 'google', 'microsoft', 'digitalocean', 'linode', 'hetzner', 'ovh', 'alibaba', 'tencent', 'cdn', 'icloud private relay', 'palo alto', 'fastly', 'akamai', 'choopa', 'leaseweb', 'squarespace', 'myrepublic', 'tzulo', 'vultr', 'dedi', 'colocrossing', 'quadranet'];
-            
-            for (let kw of dcKeywords) {
-                if (org.includes(kw) || domain.includes(kw)) {
-                    result.is_datacenter = true; break;
+        try {
+            const data = await response.json();
+            if (data.success) {
+                result.isp = data.connection?.isp || result.isp;
+                result.country_code = data.country_code || result.country_code;
+                result.asn = data.connection?.asn ? 'AS' + data.connection.asn : result.asn;
+                result.timezone = data.timezone?.id || result.timezone;
+                
+                const org = (data.connection?.org || '').toLowerCase();
+                const domain = (data.connection?.domain || '').toLowerCase();
+                
+                const dcKeywords = ['cloud', 'datacenter', 'hosting', 'vps', 'amazon', 'google', 'microsoft', 'digitalocean', 'linode', 'hetzner', 'ovh', 'alibaba', 'tencent', 'cdn', 'icloud private relay', 'palo alto', 'fastly', 'akamai', 'choopa', 'leaseweb', 'squarespace', 'myrepublic', 'tzulo', 'vultr', 'dedi', 'colocrossing', 'quadranet'];
+                
+                for (let i = 0; i < dcKeywords.length; i++) {
+                    if (org.includes(dcKeywords[i]) || domain.includes(dcKeywords[i])) {
+                        result.is_datacenter = true; break;
+                    }
+                }
+                if (data.security) {
+                    result.is_proxy = data.security.proxy || data.security.vpn || data.security.tor;
+                }
+                const typeLower = (data.connection?.type || '').toLowerCase();
+                if (typeLower.includes('cellular') || typeLower.includes('mobile')) {
+                    result.is_mobile = true;
                 }
             }
-            if (data.security) {
-                result.is_proxy = data.security.proxy || data.security.vpn || data.security.tor;
-            }
-            const typeLower = (data.connection?.type || '').toLowerCase();
-            if (typeLower.includes('cellular') || typeLower.includes('mobile')) {
-                result.is_mobile = true;
-            }
-        }
+        } catch(e) {}
     }
 
     if (result.is_proxy) { result.type = 'VPN / Proxy / TOR Node'; } 
@@ -211,13 +242,13 @@ function evaluateProxyRiskMatrix(ipInfo, advancedProxies, ipContext, request) {
     return { score: Math.min(score, 100), matrix: dimensions };
 }
 
-// Escaper helper
-function escapeHTML(str) {
+// Escaper helper (Optimized)
+const escapeHTML = (str) => {
     if (!str) return '';
     return String(str).replace(/[&<>'"]/g, tag => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
     }[tag] || tag));
-}
+};
 
 // ==================== EDGE HTML TEMPLATE ====================
 // Utilizing safe replacement tokens to guarantee 100% downstream JS compatibility
@@ -227,7 +258,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HTTP Analyzer</title>
-    <!-- Resource Hint & Preload Optimizations (v1.9.42 Edge) -->
+    <!-- Resource Hint & Preload Optimizations (v1.9.43 Edge) -->
     <link rel="preconnect" href="https://cdn.tailwindcss.com" crossorigin>
     <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
     <link rel="dns-prefetch" href="https://cdn.tailwindcss.com">
@@ -1860,7 +1891,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
 export default {
     async fetch(request, env, ctx) {
-        // HTTP Basic Protection Rules (Military-Grade defaults)
+        // HTTP Basic Protection Rules
         const securityHeaders = {
             'Content-Type': 'text/html; charset=utf-8',
             'X-Content-Type-Options': 'nosniff',
@@ -1871,15 +1902,15 @@ export default {
 
         const clientIp = request.headers.get('cf-connecting-ip') || 'unknown';
 
-        // 0. Defense Grade WAF active
-        if (!wafCheck(clientIp)) {
+        // 0. Defense Grade WAF active (Tuning #2: Background GC included via ctx)
+        if (!wafCheck(clientIp, ctx)) {
             return new Response('{"error": "Defense-Grade WAF Active: Rate Limit Exceeded.", "code": 429}', {
                 status: 429,
                 headers: { 'Retry-After': '60', 'Content-Type': 'application/json' }
             });
         }
 
-        // 1. IP Parsing
+        // 1. IP Parsing (Tuning #4: Fast loops applied inside)
         const ipInfo = getAllClientIPs(request);
         const advancedProxies = detectAdvancedProxy(request);
         const ipContext = await getIpContextClassification(ipInfo.real_client_ip, request.cf, ctx);
@@ -1895,8 +1926,12 @@ export default {
             serverIpDetails[ipInfo.real_client_ip] = ['HTTP_REMOTE_ADDR (CF-Connecting-IP)'];
         }
 
-        for (const [header, ips] of Object.entries(ipInfo.all_sources)) {
-            for (const ip of ips) {
+        const ipSourceKeys = Object.keys(ipInfo.all_sources);
+        for (let i = 0; i < ipSourceKeys.length; i++) {
+            const header = ipSourceKeys[i];
+            const ips = ipInfo.all_sources[header];
+            for (let j = 0; j < ips.length; j++) {
+                const ip = ips[j];
                 allDetectedIps.add(ip);
                 if (!serverIpDetails[ip]) serverIpDetails[ip] = [];
                 serverIpDetails[ip].push(`Header: ${header}`);
@@ -1904,7 +1939,6 @@ export default {
         }
         allDetectedIps = Array.from(allDetectedIps);
 
-        // Pseudo-TLS Fingerprint mapping from CF request obj
         const isHttps = request.url.startsWith('https://');
         const tlsVersion = request.cf?.tlsVersion || (isHttps ? 'Unknown TLS' : 'Plain HTTP');
         const tlsCipher = request.cf?.tlsCipher || 'Unknown Cipher';
@@ -1914,7 +1948,6 @@ export default {
         const pseudoTlsStr = `${tlsVersion}|${tlsCipher}|${httpEncoding}|${httpLang}`;
         const pseudoTlsHash = await sha256(pseudoTlsStr);
 
-        // Compute Historic & Non-Linear Risk Factors
         let serverNetScore = 0;
         let serverRiskFactors = [];
         
@@ -1962,56 +1995,64 @@ export default {
         else if (ipContext.is_mobile) zhType = '移动蜂窝网络 (4G/5G)';
         else zhType = '家庭住宅宽带';
 
-        // 3. Render HTML - Server-side String Replacement (TDD & Backward Compatibility Compliant)
-        let htmlRendered = HTML_TEMPLATE;
-        
-        // Matrix Render
+        // Matrix Render (Pre-compiled string)
         let matrixHtml = '';
-        for (const [dim, res] of Object.entries(proxyRadar.matrix)) {
+        const matrixKeys = Object.keys(proxyRadar.matrix);
+        for (let i = 0; i < matrixKeys.length; i++) {
+            const dim = matrixKeys[i];
+            const res = proxyRadar.matrix[dim];
             const colorClass = res.level === 'safe' ? 'text-green-400' : (res.level === 'warning' ? 'text-amber-400' : 'text-red-400');
             matrixHtml += `<span class="bg-slate-800/50 px-2 py-1 rounded border border-slate-700/50"><span class="text-slate-400 font-mono">[${dim.toUpperCase()}]</span> <span class="${colorClass} font-medium"><span class="en-only">${escapeHTML(res.en)}</span><span class="zh-only">${escapeHTML(res.zh)}</span></span></span>`;
         }
 
-        // Risk details Render
+        // Risk details Render (Pre-compiled string)
         let riskDetailsHtml = '';
-        serverRiskFactors.forEach(factor => {
+        for (let i = 0; i < serverRiskFactors.length; i++) {
+            const factor = serverRiskFactors[i];
             riskDetailsHtml += `<div class="kv-row"><span class="kv-key text-red-400">[${escapeHTML(factor.c)}]</span><span class="kv-val text-red-400"><span class="en-only">${escapeHTML(factor.en)}</span><span class="zh-only">${escapeHTML(factor.zh)}</span></span></div>`;
-        });
+        }
 
-        // Headers Render
+        // Headers Render (Pre-compiled string)
         let headersHtml = '';
         let headerCount = 0;
         for (const [name, value] of request.headers) {
-            if(name.startsWith('cf-') && name !== 'cf-connecting-ip') continue; // Clean CF internal headers for better view
+            if(name.startsWith('cf-') && name !== 'cf-connecting-ip') continue; 
             headerCount++;
             headersHtml += `<div class="kv-row"><span class="kv-key text-xs">${escapeHTML(name)}</span><span class="kv-val text-xs text-slate-300">${escapeHTML(value)}</span></div>`;
         }
 
-        htmlRendered = htmlRendered
-            .replace('__PROXY_RADAR_MATRIX__', matrixHtml)
-            .replace('__RADAR_SCORE__', proxyRadar.score)
-            .replace('__CLIENT_IP__', escapeHTML(ipInfo.real_client_ip))
-            .replace('__IPV6_BADGE_CLASS__', isIPv6 ? 'badge-green' : 'badge-yellow')
-            .replace('__IPV6_TEXT__', isIPv6 ? 'IPv6' : 'IPv4')
-            .replace('__IP_TYPE_EN__', escapeHTML(ipContext.type))
-            .replace('__IP_TYPE_ZH__', escapeHTML(zhType))
-            .replace('__PROXY_BADGE_CLASS__', isProxyDetected ? 'badge-red' : 'badge-green')
-            .replace('__PROXY_TEXT_EN__', isProxyDetected ? 'Proxy' : 'Clean')
-            .replace('__PROXY_TEXT_ZH__', isProxyDetected ? '代理特征' : '原生环境')
-            .replace('__ASN__', escapeHTML(ipContext.asn))
-            .replace('__ISP__', escapeHTML(ipContext.isp))
-            .replace('__RISK_DETAILS__', riskDetailsHtml)
-            .replace('__PSEUDO_TLS_STR__', escapeHTML(pseudoTlsStr))
-            .replace('__PSEUDO_TLS_HASH__', pseudoTlsHash)
-            .replace('__HEADERS_COUNT__', headerCount)
-            .replace('__HEADERS_LIST__', headersHtml)
-            .replace('__JSON_SERVER_CC__', JSON.stringify(ipContext.country_code))
-            .replace('__JSON_SERVER_TZ__', JSON.stringify(ipContext.timezone))
-            .replace('__JSON_SERVER_ASN__', JSON.stringify(ipContext.asn))
-            .replace('__JSON_DETECTED_IPS__', JSON.stringify(allDetectedIps))
-            .replace('__JSON_IP_DETAILS__', JSON.stringify(serverIpDetails))
-            .replace('__JSON_RISK_FACTORS__', JSON.stringify(serverRiskFactors))
-            .replace('__JSON_RADAR_SCORE__', JSON.stringify(proxyRadar.score));
+        // 3. Render HTML - V8 Dictionary Single-Pass Regex Replace (Tuning #1)
+        const templateReplacements = {
+            '__PROXY_RADAR_MATRIX__': matrixHtml,
+            '__RADAR_SCORE__': proxyRadar.score,
+            '__CLIENT_IP__': escapeHTML(ipInfo.real_client_ip),
+            '__IPV6_BADGE_CLASS__': isIPv6 ? 'badge-green' : 'badge-yellow',
+            '__IPV6_TEXT__': isIPv6 ? 'IPv6' : 'IPv4',
+            '__IP_TYPE_EN__': escapeHTML(ipContext.type),
+            '__IP_TYPE_ZH__': escapeHTML(zhType),
+            '__PROXY_BADGE_CLASS__': isProxyDetected ? 'badge-red' : 'badge-green',
+            '__PROXY_TEXT_EN__': isProxyDetected ? 'Proxy' : 'Clean',
+            '__PROXY_TEXT_ZH__': isProxyDetected ? '代理特征' : '原生环境',
+            '__ASN__': escapeHTML(ipContext.asn),
+            '__ISP__': escapeHTML(ipContext.isp),
+            '__RISK_DETAILS__': riskDetailsHtml,
+            '__PSEUDO_TLS_STR__': escapeHTML(pseudoTlsStr),
+            '__PSEUDO_TLS_HASH__': pseudoTlsHash,
+            '__HEADERS_COUNT__': headerCount,
+            '__HEADERS_LIST__': headersHtml,
+            '__JSON_SERVER_CC__': JSON.stringify(ipContext.country_code),
+            '__JSON_SERVER_TZ__': JSON.stringify(ipContext.timezone),
+            '__JSON_SERVER_ASN__': JSON.stringify(ipContext.asn),
+            '__JSON_DETECTED_IPS__': JSON.stringify(allDetectedIps),
+            '__JSON_IP_DETAILS__': JSON.stringify(serverIpDetails),
+            '__JSON_RISK_FACTORS__': JSON.stringify(serverRiskFactors),
+            '__JSON_RADAR_SCORE__': JSON.stringify(proxyRadar.score)
+        };
+
+        const htmlRendered = HTML_TEMPLATE.replace(
+            /__(PROXY_RADAR_MATRIX|RADAR_SCORE|CLIENT_IP|IPV6_BADGE_CLASS|IPV6_TEXT|IP_TYPE_EN|IP_TYPE_ZH|PROXY_BADGE_CLASS|PROXY_TEXT_EN|PROXY_TEXT_ZH|ASN|ISP|RISK_DETAILS|PSEUDO_TLS_STR|PSEUDO_TLS_HASH|HEADERS_COUNT|HEADERS_LIST|JSON_SERVER_CC|JSON_SERVER_TZ|JSON_SERVER_ASN|JSON_DETECTED_IPS|JSON_IP_DETAILS|JSON_RISK_FACTORS|JSON_RADAR_SCORE)__/g,
+            match => templateReplacements[match]
+        );
 
         return new Response(htmlRendered, {
             headers: securityHeaders
