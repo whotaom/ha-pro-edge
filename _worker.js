@@ -2,15 +2,15 @@
  * HTTP Analyzer Pro - Ultimate Merged Edition (Cloudflare Pages Edge Serverless)
  * 自动双语 / 深度真实指纹采集 / 工业级风控检测全面融合版
  * 
- * Version: v1.9.43 (Extreme Edge Performance / Ultra-Low Latency Edition)
+ * Version: v1.9.44 (CF Pages Native Accuracy Edition)
  * Deployment: Cloudflare Workers / Pages (_worker.js)
- * Changelog: V8 Loop Unrolling / Single-Pass Replace / Async WAF GC / AbortSignal Timeout
+ * Changelog: Smart X-Forwarded-For Parsing / CF Headers Exemption / Tri-Point Geo Consensus
  */
 
 // ==================== 0. Military-Grade Core (Isolate Edge WAF) ====================
 const wafCache = new Map();
 
-// Background GC to prevent main thread blocking (Tuning #2)
+// Background GC to prevent main thread blocking
 async function cleanupWafBackground() {
     const now = Date.now();
     for (const [ip, record] of wafCache.entries()) {
@@ -46,7 +46,6 @@ async function sha256(message) {
     const msgBuffer = new TextEncoder().encode(message);
     const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
-    // Fast array mapping
     let result = '';
     for (let i = 0; i < hashArray.length; i++) {
         result += hashArray[i].toString(16).padStart(2, '0');
@@ -54,11 +53,12 @@ async function sha256(message) {
     return result;
 }
 
-// ==================== 1. IP 分析与代理处理 (V8 Loop Optimized) ====================
+// ==================== 1. IP 分析与代理处理 (CF Native Optimized) ====================
 function getAllClientIPs(request) {
     const headers = request.headers;
+    const realClientIP = headers.get('cf-connecting-ip') || headers.get('x-real-ip') || 'Unknown';
+    
     const ipSources = [
-        ['CF-Connecting-IP', headers.get('cf-connecting-ip')],
         ['X-Forwarded-For', headers.get('x-forwarded-for')],
         ['X-Real-IP', headers.get('x-real-ip')],
         ['True-Client-IP', headers.get('true-client-ip')],
@@ -69,10 +69,10 @@ function getAllClientIPs(request) {
     ];
 
     let allIPs = {};
-    let realClientIP = headers.get('cf-connecting-ip') || headers.get('x-real-ip') || 'Unknown';
     let headerSpoofingSuspected = false;
+    let proxyHopsDetected = false;
 
-    // Fast loop replacing forEach for V8 optimization (Tuning #4)
+    // Fast loop replacing forEach for V8 optimization
     for (let i = 0; i < ipSources.length; i++) {
         const header = ipSources[i][0];
         const value = ipSources[i][1];
@@ -98,24 +98,36 @@ function getAllClientIPs(request) {
             if (ip) {
                 if (!allIPs[header]) allIPs[header] = [];
                 allIPs[header].push(ip);
+                
+                // CF Edge Adaptation: Ignore exact match with CF-Connecting-IP
+                // If any IP in the chain differs from the real IP, there is an external proxy hop before CF.
+                if (ip !== realClientIP) {
+                    proxyHopsDetected = true;
+                }
             }
         }
+    }
+
+    // Detect if CF-Connecting-IP is missing but X-Forwarded-For exists (Edge Gateway Spoofing)
+    if (!headers.has('cf-connecting-ip') && headers.has('x-forwarded-for')) {
+        headerSpoofingSuspected = true;
     }
 
     return {
         real_client_ip: realClientIP,
         all_sources: allIPs,
         remote_addr: realClientIP,
-        is_header_spoofed: headerSpoofingSuspected
+        is_header_spoofed: headerSpoofingSuspected,
+        proxy_hops: proxyHopsDetected
     };
 }
 
 function detectAdvancedProxy(request) {
+    // Exclude 'x-forwarded-proto', 'x-forwarded-port', 'x-real-ip' as they are standard in CF Pages/Workers
     const proxyHeaders = [
-        'via', 'proxy-connection', 'x-forwarded-port', 'x-forwarded-proto', 
-        'x-proxy-id', 'surrogate-capability', 'x-bluecoat-via', 'x-squid-error', 
-        'x-proxyuser-ip', 'x-arr-log-id', 'x-router', 'x-cache', 
-        'x-cache-lookup', 'x-gateway-domain', 'x-network-info', 
+        'via', 'proxy-connection', 'x-proxy-id', 'surrogate-capability', 
+        'x-bluecoat-via', 'x-squid-error', 'x-proxyuser-ip', 'x-arr-log-id', 
+        'x-router', 'x-cache-lookup', 'x-gateway-domain', 'x-network-info', 
         'x-forwarded-server', 'x-forwarded-host', 'max-forwards', 
         'x-proxy-authorization', 'x-original-url', 'x-original-forwarded-for'
     ];
@@ -149,7 +161,7 @@ async function getIpContextClassification(ip, cfData, ctx) {
 
     if (!response) {
         try {
-            // Hard timeout via AbortSignal to guarantee Edge 0ms TTFB (Tuning #3)
+            // Hard timeout via AbortSignal to guarantee Edge 0ms TTFB
             response = await fetch(cacheKey, { 
                 cf: { cacheTtl: 86400 },
                 signal: AbortSignal.timeout(300) 
@@ -209,11 +221,12 @@ function evaluateProxyRiskMatrix(ipInfo, advancedProxies, ipContext, request) {
     
     let score = 0;
 
+    // Smart Gateway Exemption Logic for CF Pages
     if (ipInfo.is_header_spoofed) {
         dimensions['headers'] = {level: 'danger', en: 'CRITICAL: Header Spoofing / Untrusted Gateway', zh: '高危：检测到边缘节点请求源伪造 (非受信网关透传)'};
         score += 55;
-    } else if (Object.keys(ipInfo.all_sources).length > 0 || advancedProxies.length > 0) {
-        dimensions['headers'] = {level: 'warning', en: 'Proxy Gateway Headers Detected', zh: '检测到代理网关/CDN转发头特征'};
+    } else if (ipInfo.proxy_hops || advancedProxies.length > 0) {
+        dimensions['headers'] = {level: 'warning', en: 'Proxy Gateway / Multi-Hop Headers Detected', zh: '检测到代理网关/多层转发头特征'};
         score += 35;
     } else if (!request.headers.get('accept-language') || !request.headers.get('user-agent')) {
         dimensions['headers'] = {level: 'warning', en: 'Anomalous Request Headers', zh: '头部缺失标准浏览器标识(高疑)'};
@@ -258,7 +271,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HTTP Analyzer</title>
-    <!-- Resource Hint & Preload Optimizations (v1.9.43 Edge) -->
+    <!-- Resource Hint & Preload Optimizations (v1.9.44 Edge) -->
     <link rel="preconnect" href="https://cdn.tailwindcss.com" crossorigin>
     <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
     <link rel="dns-prefetch" href="https://cdn.tailwindcss.com">
@@ -1240,10 +1253,15 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             apiIpMatch = \`<span class='text-slate-500'><span class="en-only">Blocked / Unavailable</span><span class="zh-only">接口阻断 / 无数据</span></span>\`;
         }
 
+        // Tri-Point Geo Consensus Logic
         const validCcs = validApis.map(a => a.cc).filter(Boolean);
-        if (validCcs.length > 0 && SERVER_CC !== 'Unknown' && validCcs.some(cc => cc !== SERVER_CC)) {
-            apiGeoMatch = \`<span class='text-red-400 font-bold'><span class="en-only">Conflict</span><span class="zh-only">跨域冲突</span> (\${escapeHTML(SERVER_CC)} vs \${escapeHTML(validCcs[0])})</span>\`;
-        } else if (validCcs.length === 0) { 
+        let uniqueCcs = [...new Set(validCcs)];
+        
+        if (uniqueCcs.length > 1) {
+            apiGeoMatch = \`<span class='text-red-400 font-bold'><span class="en-only">API Geo Divergence</span><span class="zh-only">物理定位多点分歧</span> (\${escapeHTML(uniqueCcs.join('/'))})</span>\`;
+        } else if (uniqueCcs.length > 0 && SERVER_CC !== 'Unknown' && uniqueCcs[0] !== SERVER_CC) {
+            apiGeoMatch = \`<span class='text-red-400 font-bold'><span class="en-only">Edge vs API Conflict</span><span class="zh-only">端云跨域冲突</span> (\${escapeHTML(SERVER_CC)} vs \${escapeHTML(uniqueCcs[0])})</span>\`;
+        } else if (uniqueCcs.length === 0) { 
             apiGeoMatch = \`<span class='text-slate-500'><span class="en-only">Blocked / Unavailable</span><span class="zh-only">接口阻断 / 无数据</span></span>\`; 
         } else {
             apiGeoMatch = \`<span class='text-green-400'><span class="en-only">Consensus Reached</span><span class="zh-only">物理定位完全一致</span></span>\`;
@@ -1357,7 +1375,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         }
         
         const validApis = [calib.cf, calib.geojs].filter(a => a && a.ip);
-        const validCcs = validApis.map(a => a.cc).filter(Boolean);
         const serverIps = [P_CLIENT_IP, ...SERVER_DETECTED_IPS];
 
         if (rtcMeta) {
@@ -1480,8 +1497,12 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             updateProxyRadar(0, 'DUAL_STACK', 'Dual-Stack Protocol Consistent', '跨栈校对：主干与探测节点分别触达 IPv4/IPv6 双栈网络(安全)', 'sky');
         }
         
-        if (validCcs.length > 0 && SERVER_CC !== 'Unknown' && validCcs.some(cc => cc !== SERVER_CC)) { 
-            addRisk("Network", "Geo-Location Consensus Failure", "开放API地理位置跨维校对失败", 20); 
+        const validCcs = validApis.map(a => a.cc).filter(Boolean);
+        let uniqueCcs = [...new Set(validCcs)];
+        if (uniqueCcs.length > 1) { 
+            addRisk("Network", "API Geo-Location Divergence", "不同开放API探测到冲突的物理位置(高危)", 25); 
+        } else if (uniqueCcs.length > 0 && SERVER_CC !== 'Unknown' && uniqueCcs[0] !== SERVER_CC) { 
+            addRisk("Network", "Edge vs API Geo-Location Conflict", "端云(CF)节点定位与探测API定位物理跨域", 20); 
         }
         
         const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
@@ -1902,7 +1923,7 @@ export default {
 
         const clientIp = request.headers.get('cf-connecting-ip') || 'unknown';
 
-        // 0. Defense Grade WAF active (Tuning #2: Background GC included via ctx)
+        // 0. Defense Grade WAF active
         if (!wafCheck(clientIp, ctx)) {
             return new Response('{"error": "Defense-Grade WAF Active: Rate Limit Exceeded.", "code": 429}', {
                 status: 429,
@@ -1910,7 +1931,7 @@ export default {
             });
         }
 
-        // 1. IP Parsing (Tuning #4: Fast loops applied inside)
+        // 1. IP Parsing
         const ipInfo = getAllClientIPs(request);
         const advancedProxies = detectAdvancedProxy(request);
         const ipContext = await getIpContextClassification(ipInfo.real_client_ip, request.cf, ctx);
@@ -1934,7 +1955,9 @@ export default {
                 const ip = ips[j];
                 allDetectedIps.add(ip);
                 if (!serverIpDetails[ip]) serverIpDetails[ip] = [];
-                serverIpDetails[ip].push(`Header: ${header}`);
+                if (!serverIpDetails[ip].includes(`Header: ${header}`)) {
+                    serverIpDetails[ip].push(`Header: ${header}`);
+                }
             }
         }
         allDetectedIps = Array.from(allDetectedIps);
@@ -1955,15 +1978,16 @@ export default {
             serverNetScore += 55;
             serverRiskFactors.push({c: 'Network', en: 'Untrusted Gateway Headers Spoofed (+55)', zh: '非可信网关注入代理头/源IP伪造 (+55)', s: 55});
         }
+        // Specific Proxy Hops evaluation (CF Exempted)
+        if (ipInfo.proxy_hops) {
+            serverNetScore += 10;
+            serverRiskFactors.push({c: 'Network', en: 'X-Forwarded-For Multi-Hop Detected (+10)', zh: '检测到 X-Forwarded-For 多层代理转发 (+10)', s: 10});
+        }
         if (request.headers.has('via')) {
             serverNetScore += 15;
             serverRiskFactors.push({c: 'Network', en: 'VIA Header Detected (+15)', zh: '检测到 VIA 代理头 (+15)', s: 15});
         }
-        if (request.headers.has('x-forwarded-for')) {
-            serverNetScore += 10;
-            serverRiskFactors.push({c: 'Network', en: 'X-Forwarded-For Detected (+10)', zh: '检测到 X-Forwarded-For (+10)', s: 10});
-        }
-        if (advancedProxies.length > 0 && !request.headers.has('via') && !request.headers.has('x-forwarded-for')) {
+        if (advancedProxies.length > 0 && !request.headers.has('via')) {
             serverNetScore += 20;
             serverRiskFactors.push({c: 'Network', en: 'Advanced Proxy Protocols (+20)', zh: '检测到隐蔽代理特征头 (+20)', s: 20});
         }
@@ -1987,7 +2011,7 @@ export default {
         }
 
         const isIPv6 = ipInfo.real_client_ip.includes(':');
-        const isProxyDetected = (ipInfo.all_sources['X-Forwarded-For'] || ipInfo.all_sources['Forwarded'] || advancedProxies.length > 0 || ipContext.is_datacenter || ipContext.is_proxy || ipInfo.is_header_spoofed);
+        const isProxyDetected = (ipInfo.proxy_hops || advancedProxies.length > 0 || ipContext.is_datacenter || ipContext.is_proxy || ipInfo.is_header_spoofed);
 
         let zhType = '未知网络';
         if (ipContext.is_proxy) zhType = '已知代理 / VPN节点';
@@ -2021,7 +2045,7 @@ export default {
             headersHtml += `<div class="kv-row"><span class="kv-key text-xs">${escapeHTML(name)}</span><span class="kv-val text-xs text-slate-300">${escapeHTML(value)}</span></div>`;
         }
 
-        // 3. Render HTML - V8 Dictionary Single-Pass Regex Replace (Tuning #1)
+        // 3. Render HTML - V8 Dictionary Single-Pass Regex Replace
         const templateReplacements = {
             '__PROXY_RADAR_MATRIX__': matrixHtml,
             '__RADAR_SCORE__': proxyRadar.score,
