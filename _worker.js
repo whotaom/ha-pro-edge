@@ -2,31 +2,39 @@
  * HTTP Analyzer Pro - Ultimate Merged Edition (Cloudflare Pages Edge Serverless)
  * 自动双语 / 深度真实指纹采集 / 工业级风控检测全面融合版
  * 
- * Version: v1.9.44 (CF Pages Native Accuracy Edition)
+ * Version: v1.9.46 (Physical Layer Accuracy & Anti-Spoofing Edition)
  * Deployment: Cloudflare Workers / Pages (_worker.js)
- * Changelog: Smart X-Forwarded-For Parsing / CF Headers Exemption / Tri-Point Geo Consensus
+ * Changelog: 
+ * - [v1.9.46] Extreme Proxy Accuracy / L4 TCP RTT Heuristics / TLS-UA Mismatch / Probe Latency Profiling
+ * - [v1.9.45] Chunked WAF GC / Idle-Frame Scheduler / Deep Proxy SandBox Detection
  */
 
 // ==================== 0. Military-Grade Core (Isolate Edge WAF) ====================
 const wafCache = new Map();
 
-// Background GC to prevent main thread blocking
+// Optimized Background GC: Chunked execution to prevent V8 main thread blocking during mass CC attacks
 async function cleanupWafBackground() {
     const now = Date.now();
+    let deletedCount = 0;
+    
+    // Chunked iteration (Max 1000 items per GC cycle to keep CPU < 10ms)
     for (const [ip, record] of wafCache.entries()) {
         if (now - record.ts > 60000) {
             wafCache.delete(ip);
+            deletedCount++;
         }
+        if (deletedCount >= 1000) break;
     }
-    // Fallback absolute clear if still bloated
-    if (wafCache.size > 5000) wafCache.clear();
+    
+    // Absolute brute-force fallback for extreme bloating
+    if (wafCache.size > 10000) wafCache.clear();
 }
 
 function wafCheck(ip, ctx) {
     const now = Date.now();
     const limit = 150; // Enterprise max requests per minute
 
-    // Non-blocking WAF eviction via ctx.waitUntil
+    // Non-blocking WAF eviction via ctx.waitUntil (Offloaded to Edge microtasks)
     if (wafCache.size > 3000) {
         ctx.waitUntil(cleanupWafBackground());
     }
@@ -41,7 +49,7 @@ function wafCheck(ip, ctx) {
     return record.hits <= limit;
 }
 
-// Crypto hashing for backend
+// Crypto hashing for backend (Optimized ArrayBuffer transformation)
 async function sha256(message) {
     const msgBuffer = new TextEncoder().encode(message);
     const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
@@ -123,13 +131,14 @@ function getAllClientIPs(request) {
 }
 
 function detectAdvancedProxy(request) {
-    // Exclude 'x-forwarded-proto', 'x-forwarded-port', 'x-real-ip' as they are standard in CF Pages/Workers
+    // Exclude standard CF Headers, rigorously expanded for cloud/microservices leak detection (v1.9.46)
     const proxyHeaders = [
         'via', 'proxy-connection', 'x-proxy-id', 'surrogate-capability', 
         'x-bluecoat-via', 'x-squid-error', 'x-proxyuser-ip', 'x-arr-log-id', 
         'x-router', 'x-cache-lookup', 'x-gateway-domain', 'x-network-info', 
         'x-forwarded-server', 'x-forwarded-host', 'max-forwards', 
-        'x-proxy-authorization', 'x-original-url', 'x-original-forwarded-for'
+        'x-proxy-authorization', 'x-original-url', 'x-original-forwarded-for',
+        'x-amzn-trace-id', 'x-b3-traceid', 'x-host', 'x-originating-ip', 'x-client-ip'
     ];
     let detected = [];
     for (let i = 0; i < proxyHeaders.length; i++) {
@@ -161,7 +170,7 @@ async function getIpContextClassification(ip, cfData, ctx) {
 
     if (!response) {
         try {
-            // Hard timeout via AbortSignal to guarantee Edge 0ms TTFB
+            // Hard timeout via AbortSignal to guarantee Edge TTFB
             response = await fetch(cacheKey, { 
                 cf: { cacheTtl: 86400 },
                 signal: AbortSignal.timeout(300) 
@@ -252,15 +261,29 @@ function evaluateProxyRiskMatrix(ipInfo, advancedProxies, ipContext, request) {
         score += 20;
     }
 
+    // [v1.9.46] Physical Layer RTT Anomaly Detection (Defeats L7 spoofers)
+    const tcpRtt = request.cf?.clientTcpRtt || 0;
+    if (tcpRtt > 0 && tcpRtt <= 15 && !ipContext.is_datacenter && (ipContext.is_mobile || ipContext.type.includes('Residential'))) {
+        dimensions['rtt'] = {level: 'warning', en: 'L4 TCP RTT Anomaly (Proxy Tunnel)', zh: '延时异动：家庭/移动网络测得极低底层TCP RTT(疑似同城代理中转)'};
+        score += 25;
+    }
+
+    // [v1.9.46] TLS vs User-Agent Mismatch Heuristics
+    const tlsVersion = request.cf?.tlsVersion || '';
+    const ua = request.headers.get('user-agent') || '';
+    if (tlsVersion === 'TLSv1.2' && /Chrome\/(1[1-9][0-9]|2[0-9]{2})/.test(ua) && !ua.includes('Mobile')) {
+        dimensions['tls_ua'] = {level: 'warning', en: 'TLS Downgrade / UA Mismatch', zh: '特征异常：极新版现代浏览器发生底层TLS降级(高度疑似MITM代理/指纹伪装)'};
+        score += 20;
+    }
+
     return { score: Math.min(score, 100), matrix: dimensions };
 }
 
-// Escaper helper (Optimized)
+// Escaper helper (Optimized Dictionary RegExp mapping)
 const escapeHTML = (str) => {
     if (!str) return '';
-    return String(str).replace(/[&<>'"]/g, tag => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
-    }[tag] || tag));
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' };
+    return String(str).replace(/[&<>'"]/g, match => map[match]);
 };
 
 // ==================== EDGE HTML TEMPLATE ====================
@@ -271,7 +294,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HTTP Analyzer</title>
-    <!-- Resource Hint & Preload Optimizations (v1.9.44 Edge) -->
+    <!-- Resource Hint & Preload Optimizations (v1.9.46 Edge) -->
     <link rel="preconnect" href="https://cdn.tailwindcss.com" crossorigin>
     <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
     <link rel="dns-prefetch" href="https://cdn.tailwindcss.com">
@@ -284,15 +307,17 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         body { background-color: #0f172a; color: #f8fafc; font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; }
         body.lang-zh .en-only { display: none !important; } body.lang-en .zh-only { display: none !important; }
         
-        #ha-preloader { position: fixed; inset: 0; z-index: 99999; background: #0f172a; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: opacity 0.6s cubic-bezier(0.4, 0, 0.2, 1), visibility 0.6s; backdrop-filter: blur(10px); }
+        #ha-preloader { position: fixed; inset: 0; z-index: 99999; background: #0f172a; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: opacity 0.6s cubic-bezier(0.4, 0, 0.2, 1), visibility 0.6s; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
         #ha-preloader.loaded { opacity: 0; visibility: hidden; pointer-events: none; }
         .loader-spinner { width: 56px; height: 56px; border: 4px solid #1e293b; border-top-color: #38bdf8; border-bottom-color: #818cf8; border-radius: 50%; animation: spin 1s linear infinite; }
         .loader-text { margin-top: 1.5rem; color: #38bdf8; font-family: ui-monospace, monospace; font-size: 0.875rem; letter-spacing: 0.15em; animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; font-weight: 600; text-shadow: 0 0 10px rgba(56, 189, 248, 0.3); }
         @keyframes spin { 100% { transform: rotate(360deg); } }
 
-        .card { background-color: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 1.25rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+        .card { background-color: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 1.25rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); transition: transform 0.2s ease, box-shadow 0.2s ease; }
+        .card:hover { box-shadow: 0 10px 15px -3px rgba(0,0,0,0.2); }
         .card-header { font-size: 1.125rem; font-weight: 600; color: #38bdf8; margin-bottom: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; display: flex; justify-content: space-between; align-items: center; }
-        .kv-row { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px dashed #334155; font-size: 0.875rem; }
+        .kv-row { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px dashed #334155; font-size: 0.875rem; transition: background-color 0.2s; }
+        .kv-row:hover { background-color: rgba(30, 41, 59, 0.5); }
         .kv-row:last-child { border-bottom: none; }
         .kv-key { color: #94a3b8; flex-shrink: 0; padding-right: 12px; }
         .kv-val { color: #e2e8f0; font-family: ui-monospace, monospace; word-break: break-all; text-align: right; max-width: 75%; line-height: 1.5; }
@@ -306,24 +331,26 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         .lang-btn { background: #334155; border-radius: 0.5rem; padding: 0.25rem 0.75rem; cursor: pointer; font-size: 0.875rem; transition: background 0.2s; }
         .lang-btn:hover { background: #475569; }
 
-        .network-card { background: rgba(30, 41, 59, 0.7); border: 1px solid #334155; border-radius: 0.75rem; padding: 1rem; position: relative; overflow: hidden; transition: all 0.3s; }
-        .network-card:hover { transform: translateY(-2px); border-color: #38bdf8; box-shadow: 0 4px 12px rgba(56, 189, 248, 0.15); }
+        .network-card { background: rgba(30, 41, 59, 0.7); border: 1px solid #334155; border-radius: 0.75rem; padding: 1rem; position: relative; overflow: hidden; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+        .network-card:hover { transform: translateY(-3px); border-color: #38bdf8; box-shadow: 0 6px 16px rgba(56, 189, 248, 0.15); }
         .network-card.has-flag-badge::after { content: ''; position: absolute; bottom: -15px; right: -10px; width: 100px; height: 70px; background-image: var(--flag-badge-url); background-size: cover; background-position: center; filter: blur(4px) opacity(0.15); transform: rotate(15deg); pointer-events: none; z-index: 0; }
-        .status-indicator { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+        .status-indicator { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; transition: background-color 0.3s; }
         .status-loading { background: #fbbf24; box-shadow: 0 0 5px #fbbf24; animation: pulse 1.5s infinite; }
         .status-success { background: #10b981; box-shadow: 0 0 5px #10b981; }
         .status-error { background: #ef4444; box-shadow: 0 0 5px #ef4444; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-        #ipDetailModal { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6); backdrop-filter: blur(4px); z-index: 50; align-items: center; justify-content: center; padding: 1rem; }
-        #ipDetailModal.show { display: flex; }
-        .ip-modal-content { background: #1e293b; border: 1px solid #334155; border-radius: 1rem; width: 100%; max-width: 800px; max-height: 90vh; overflow-y: auto; position: relative; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5); }
+        #ipDetailModal { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); z-index: 50; align-items: center; justify-content: center; padding: 1rem; transition: opacity 0.3s ease; }
+        #ipDetailModal.show { display: flex; animation: modalFadeIn 0.3s ease-out forwards; }
+        @keyframes modalFadeIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+        .ip-modal-content { background: #1e293b; border: 1px solid #334155; border-radius: 1rem; width: 100%; max-width: 800px; max-height: 90vh; overflow-y: auto; position: relative; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6); }
         .ip-modal-header { padding: 1.25rem 1.5rem; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: #1e293b; z-index: 10; }
         .ip-modal-body { padding: 0; display: flex; flex-direction: column; }
         .ip-modal-map { height: 250px; background: #0f172a; width: 100%; border-bottom: 1px solid #334155; }
         .ip-modal-grid { display: grid; grid-template-columns: 1fr; gap: 1.5rem; padding: 1.5rem; }
         @media (min-width: 768px) { .ip-modal-grid { grid-template-columns: 1fr 1fr; } }
-        .ip-detail-card { background: rgba(15, 23, 42, 0.5); border-radius: 0.75rem; padding: 1rem; border: 1px solid #334155; }
+        .ip-detail-card { background: rgba(15, 23, 42, 0.5); border-radius: 0.75rem; padding: 1rem; border: 1px solid #334155; transition: border-color 0.2s; }
+        .ip-detail-card:hover { border-color: #475569; }
         .ip-detail-row { display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px dashed #334155; font-size: 0.85rem; }
         .ip-detail-row:last-child { border-bottom: none; }
         
@@ -429,7 +456,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             <span>🌍 <span class="en-only">Client-Side Routing Intelligence (Split Tunneling)</span><span class="zh-only">当前网络信息 (客户端分流探测)</span></span>
         </h3>
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-2">
-            <div class="network-card bg-slate-800 border border-slate-700 rounded-xl p-4 relative overflow-hidden transition-all hover:-translate-y-1 hover:border-sky-400 hover:shadow-lg hover:shadow-sky-900/20" id="card-ipip">
+            <div class="network-card bg-slate-800 border border-slate-700 rounded-xl p-4 relative overflow-hidden" id="card-ipip">
                 <div class="relative z-10 flex flex-col h-full">
                     <div class="flex items-center gap-2 mb-3">
                         <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse status-indicator" id="status-ipip"></span>
@@ -446,7 +473,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                     </div>
                 </div>
             </div>
-            <div class="network-card bg-slate-800 border border-slate-700 rounded-xl p-4 relative overflow-hidden transition-all hover:-translate-y-1 hover:border-sky-400 hover:shadow-lg hover:shadow-sky-900/20" id="card-overseas">
+            <div class="network-card bg-slate-800 border border-slate-700 rounded-xl p-4 relative overflow-hidden" id="card-overseas">
                 <div class="relative z-10 flex flex-col h-full">
                     <div class="flex items-center gap-2 mb-3">
                         <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse status-indicator" id="status-overseas"></span>
@@ -463,7 +490,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                     </div>
                 </div>
             </div>
-            <div class="network-card bg-slate-800 border border-slate-700 rounded-xl p-4 relative overflow-hidden transition-all hover:-translate-y-1 hover:border-sky-400 hover:shadow-lg hover:shadow-sky-900/20" id="card-cf">
+            <div class="network-card bg-slate-800 border border-slate-700 rounded-xl p-4 relative overflow-hidden" id="card-cf">
                 <div class="relative z-10 flex flex-col h-full">
                     <div class="flex items-center gap-2 mb-3">
                         <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse status-indicator" id="status-cf"></span>
@@ -480,7 +507,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                     </div>
                 </div>
             </div>
-            <div class="network-card bg-slate-800 border border-slate-700 rounded-xl p-4 relative overflow-hidden transition-all hover:-translate-y-1 hover:border-sky-400 hover:shadow-lg hover:shadow-sky-900/20" id="card-outside">
+            <div class="network-card bg-slate-800 border border-slate-700 rounded-xl p-4 relative overflow-hidden" id="card-outside">
                 <div class="relative z-10 flex flex-col h-full">
                     <div class="flex items-center gap-2 mb-3">
                         <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse status-indicator" id="status-outside"></span>
@@ -573,7 +600,10 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             preloader.classList.add('loaded');
         }
     };
+    
+    // Ensure Preloader doesn't permanently lock screen on weak network
     window.addEventListener('load', removePreloader);
+    setTimeout(removePreloader, 4000); // 4s ultimate fallback
 
     const P_CLIENT_IP = document.getElementById('main-client-ip').innerText;
     const SERVER_CC = __JSON_SERVER_CC__;
@@ -582,6 +612,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     const SERVER_DETECTED_IPS = __JSON_DETECTED_IPS__;
     const SERVER_IP_DETAILS = __JSON_IP_DETAILS__;
     const SERVER_BASE_RISK_FACTORS = __JSON_RISK_FACTORS__;
+    const SERVER_RTT = parseInt(__JSON_SERVER_RTT__); // [v1.9.46] Physical Layer TCP RTT
     
     let globalRadarScore = parseInt(__JSON_RADAR_SCORE__);
     
@@ -591,9 +622,14 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     if(navigator.language.startsWith('zh')) bodyLang.classList.replace('lang-en', 'lang-zh');
     function toggleLang() { bodyLang.classList.replace(bodyLang.classList.contains('lang-en') ? 'lang-en' : 'lang-zh', bodyLang.classList.contains('lang-en') ? 'lang-zh' : 'lang-en'); }
 
-    const escapeHTML = str => { if (!str) return ''; return String(str).replace(/[&<>'"]/g, tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag])); };
+    const escapeHTML = str => { if (!str) return ''; const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }; return String(str).replace(/[&<>'"]/g, m => map[m]); };
     
-    const executeAsync = async (fn) => { try { return await fn(); } catch(e) { return 'Blocked'; } };
+    // Idle Frame Scheduler to prevent UI locking during heavy biometrics processing
+    const executeAsync = (fn) => new Promise(resolve => {
+        const wrap = () => { try { resolve(fn()); } catch(e) { resolve('Blocked'); } };
+        if (window.requestIdleCallback) requestIdleCallback(wrap, { timeout: 1500 });
+        else setTimeout(wrap, 0);
+    });
 
     const sha256 = async (str) => {
         try {
@@ -1181,6 +1217,16 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const dataSaverOutput = conn && conn.saveData ? 
             "<span class='text-red-400'><span class='en-only'>Enabled</span><span class='zh-only'>已开启代理压缩</span></span>" : 
             "<span class='en-only'>Disabled</span><span class='zh-only'>未启用</span>";
+            
+        // [v1.9.46] Physical TCP RTT vs Application RTT Logic
+        let rttHtml = conn ? conn.rtt + ' ms (L7 App)' : "Unknown";
+        if (SERVER_RTT > 0) {
+            let rttClass = "text-sky-400";
+            if (conn && conn.rtt && Math.abs(conn.rtt - SERVER_RTT) >= 150) {
+                rttClass = "text-red-400 font-bold"; // High differential indicates likely proxy tunneling
+            }
+            rttHtml += ` / <span class="${rttClass}" title="Server Layer-4 TCP Round Trip Time">L4 TCP: ${SERVER_RTT} ms</span>`;
+        }
 
         return {
             "WebRTC IP Leak||WebRTC 底层 IP 泄漏": ipLeakHtml,
@@ -1189,7 +1235,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             "Network Type||底层网络类型": conn ? conn.effectiveType : "Unknown",
             "Data Saver Proxy||流量节点 (Data Saver)": dataSaverOutput,
             "Est. Downlink||下行带宽估算": conn ? conn.downlink + ' Mbps' : "Unknown",
-            "RTT (Latency)||链路延迟 (RTT)": conn ? conn.rtt + ' ms' : "Unknown",
+            "RTT (Latency)||链路延迟 (RTT)": rttHtml,
             "Timezone (Local)||系统底层时区": Intl.DateTimeFormat().resolvedOptions().timeZone,
             "UTC Offset||格林威治偏移": \`GMT \${new Date().getTimezoneOffset() / -60}\`
         };
@@ -1301,6 +1347,9 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
         const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(uaGlobal);
         const isAppleDevice = /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
+
+        // Advanced Proxy Object / Navigator override detection
+        try { if (Object.getOwnPropertyNames(navigator).includes('webdriver')) addRisk("Behavior", "WebDriver Property Override", "原生 WebDriver 属性被强制覆盖保护", 40); } catch(e){}
 
         if (checkNativeTampering(Navigator.prototype, 'webdriver')) {
             addRisk("Behavior", "Prototype Tampering (Stealth)", "检测到浏览器底层原型链伪造 (隐身防关联插件)", 40);
@@ -1576,8 +1625,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             });
         },
 
-        updateUI(id, status, ip, loc, provider='', countryCode='', asn='') {
-            this.dataMap[id] = { ip: ip, loc: loc, cc: countryCode, asn: asn };
+        updateUI(id, status, ip, loc, provider='', countryCode='', asn='', rawTime=0) {
+            this.dataMap[id] = { ip: ip, loc: loc, cc: countryCode, asn: asn, rawTime: rawTime };
             const statusEl = document.getElementById(\`status-\${id}\`);
             const valEl = document.getElementById(\`val-\${id}\`);
             const locEl = document.getElementById(\`loc-\${id}\`);
@@ -1620,14 +1669,20 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
         async probeDomestic() {
             try {
+                const t0 = performance.now();
+                const req = (name, p) => p.then(d => { 
+                    if(!d||!d.ip) throw 'e'; 
+                    const t = Math.round(performance.now() - t0); 
+                    return {ip: d.ip, prov: \`\${name} ⚡\${t}ms\`, rawTime: t}; 
+                });
                 const res = await Promise.any([
-                    this.jsonp('https://vv.video.qq.com/checktime?otype=json', 'callback', 3500).then(d => { if(!d||!d.ip) throw 'e'; return {ip: d.ip, prov: 'Tencent'}; }),
-                    this.fetchTimeout('https://qifu-api.baidubce.com/ip/local/geo/v1/district', {}, 3500).then(r=>r.json()).then(d => { if(!d||!d.data||!d.data.ip) throw 'e'; return {ip: d.data.ip, prov: 'Baidu'}; }),
-                    this.fetchTimeout('https://perfops2.byte-test.com/500b-bench.jpg', {method:'HEAD'}, 3500).then(r => { const ip=r.headers.get('X-Request-Ip'); if(!ip) throw 'e'; return {ip: ip, prov: 'ByteDance'}; }),
-                    this.jsonp('https://whois.pconline.com.cn/ipJson.jsp', 'callback', 3500).then(d => { if(!d||!d.ip) throw 'e'; return {ip: d.ip, prov: 'PConline'}; })
+                    req('Tencent', this.jsonp('https://vv.video.qq.com/checktime?otype=json', 'callback', 3500)),
+                    req('Baidu', this.fetchTimeout('https://qifu-api.baidubce.com/ip/local/geo/v1/district', {}, 3500).then(r=>r.json()).then(d=>d.data)),
+                    req('ByteDance', this.fetchTimeout('https://perfops2.byte-test.com/500b-bench.jpg', {method:'HEAD'}, 3500).then(r => ({ip:r.headers.get('X-Request-Ip')}))),
+                    req('PConline', this.jsonp('https://whois.pconline.com.cn/ipJson.jsp', 'callback', 3500))
                 ]);
                 const info = await this.getIpInfo(res.ip);
-                this.updateUI('ipip', 'success', info.ip, info.loc, res.prov, info.cc, info.asn);
+                this.updateUI('ipip', 'success', info.ip, info.loc, res.prov, info.cc, info.asn, res.rawTime);
             } catch(e) {
                 this.updateUI('ipip', 'error', '', '');
             }
@@ -1635,14 +1690,22 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
         async probeOverseas() {
             try {
+                const t0 = performance.now();
+                const req = (name, p) => p.then(d => { 
+                    if(!d.ip) throw 'e'; 
+                    const t = Math.round(performance.now() - t0); 
+                    d.prov = \`\${name} ⚡\${t}ms\`; 
+                    d.rawTime = t; 
+                    return d; 
+                });
                 const res = await Promise.any([
-                    this.fetchTimeout('https://api.ipapi.is', {}, 3500).then(r=>r.json()).then(d=>{ if(!d.ip) throw 'e'; return {ip:d.ip, cc:d.location?.country_code, asn:d.asn?.asn?\`AS\${d.asn.asn}\`:'', org:d.company?.name, prov:'ipapi'} }),
-                    this.fetchTimeout('https://api.cmliussss.net/api/ipinfo', {}, 3500).then(r=>r.json()).then(d=>{ if(!d.ip) throw 'e'; return {ip:d.ip, cc:d.country_code, asn:d.asn?.replace('AS','')?\`AS\${d.asn.replace('AS','')}\`:'', org:d.as_name, prov:'cmliussss'} }),
-                    this.fetchTimeout('https://ipinfo.io/json', {}, 3500).then(r=>r.json()).then(d=>{ if(!d.ip) throw 'e'; return {ip:d.ip, cc:d.country, asn:d.org?d.org.split(' ')[0]:'', org:d.org?d.org.substring(d.org.indexOf(' ')+1):'', prov:'IPinfo'} }),
-                    this.fetchTimeout('https://ifconfig.co/json', {}, 3500).then(r=>r.json()).then(d=>{ if(!d.ip) throw 'e'; return {ip:d.ip, cc:d.country_iso, asn:d.asn?\`AS\${d.asn}\`:'', org:d.asn_org, prov:'Ifconfig'} })
+                    req('ipapi', this.fetchTimeout('https://api.ipapi.is', {}, 3500).then(r=>r.json()).then(d=>({ip:d.ip, cc:d.location?.country_code, asn:d.asn?.asn?\`AS\${d.asn.asn}\`:'', org:d.company?.name}))),
+                    req('cmliussss', this.fetchTimeout('https://api.cmliussss.net/api/ipinfo', {}, 3500).then(r=>r.json()).then(d=>({ip:d.ip, cc:d.country_code, asn:d.asn?.replace('AS','')?\`AS\${d.asn.replace('AS','')}\`:'', org:d.as_name}))),
+                    req('IPinfo', this.fetchTimeout('https://ipinfo.io/json', {}, 3500).then(r=>r.json()).then(d=>({ip:d.ip, cc:d.country, asn:d.org?d.org.split(' ')[0]:'', org:d.org?d.org.substring(d.org.indexOf(' ')+1):''}))),
+                    req('Ifconfig', this.fetchTimeout('https://ifconfig.co/json', {}, 3500).then(r=>r.json()).then(d=>({ip:d.ip, cc:d.country_iso, asn:d.asn?\`AS\${d.asn}\`:'', org:d.asn_org})))
                 ]);
                 const loc = \`\${res.cc || ''} \${res.asn || ''} \${res.org || ''}\`.trim();
-                this.updateUI('overseas', 'success', res.ip, loc, res.prov, res.cc, res.asn);
+                this.updateUI('overseas', 'success', res.ip, loc, res.prov, res.cc, res.asn, res.rawTime);
             } catch(e) {
                 this.updateUI('overseas', 'error', '', '');
             }
@@ -1650,15 +1713,22 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
         async probeCF() {
             try {
+                const t0 = performance.now();
+                const req = (name, p) => p.then(d => { 
+                    const t = Math.round(performance.now() - t0); 
+                    d.prov = \`\${name} ⚡\${t}ms\`; 
+                    d.rawTime = t; 
+                    return d; 
+                });
                 const res = await Promise.any([
-                    this.fetchTimeout('https://cloudflare.com/cdn-cgi/trace').then(r=>r.text()).then(t => {
+                    req('CF Trace', this.fetchTimeout('https://cloudflare.com/cdn-cgi/trace').then(r=>r.text()).then(t => {
                         const m = t.match(/ip=(.+)/); const l = t.match(/loc=(.+)/);
-                        if(!m) throw 'No CF IP'; return {ip:m[1], cc:l?l[1]:'', prov:'CF Trace'};
-                    }),
-                    this.fetchTimeout('https://ipv4.090227.xyz').then(r=>r.json()).then(d=>({ip:d.ip, cc:d.country, prov:'CF v4 API'}))
+                        if(!m) throw 'No CF IP'; return {ip:m[1], cc:l?l[1]:''};
+                    })),
+                    req('CF v4 API', this.fetchTimeout('https://ipv4.090227.xyz').then(r=>r.json()).then(d=>({ip:d.ip, cc:d.country})))
                 ]);
                 const info = await this.getIpInfo(res.ip).catch(() => ({ip: res.ip, loc: res.cc, cc: res.cc, asn: ''}));
-                this.updateUI('cf', 'success', info.ip, info.loc, res.prov, info.cc, info.asn);
+                this.updateUI('cf', 'success', info.ip, info.loc, res.prov, info.cc, info.asn, res.rawTime);
             } catch(e) {
                 this.updateUI('cf', 'error', '', '');
             }
@@ -1666,14 +1736,22 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
         async probeOutside() {
             try {
+                const t0 = performance.now();
+                const req = (name, p) => p.then(d => { 
+                    if(!d.ip) throw 'e'; 
+                    const t = Math.round(performance.now() - t0); 
+                    d.prov = \`\${name} ⚡\${t}ms\`; 
+                    d.rawTime = t; 
+                    return d; 
+                });
                 const res = await Promise.any([
-                    this.fetchTimeout('https://help.x.com/cdn-cgi/trace').then(r=>r.text()).then(t => {
-                        const m = t.match(/ip=(.+)/); if(!m) throw 'No X IP'; return {ip:m[1], prov:'X.com'};
-                    }),
-                    this.jsonp('https://jsonp-ip.appspot.com/').then(d => { if(!d.ip) throw 'No G IP'; return {ip:d.ip, prov:'Google'}; })
+                    req('X.com', this.fetchTimeout('https://help.x.com/cdn-cgi/trace').then(r=>r.text()).then(t => {
+                        const m = t.match(/ip=(.+)/); if(!m) throw 'No X IP'; return {ip:m[1]};
+                    })),
+                    req('Google', this.jsonp('https://jsonp-ip.appspot.com/', 'callback', 3500))
                 ]);
                 const info = await this.getIpInfo(res.ip).catch(() => ({ip: res.ip, loc: 'Unknown', cc: '', asn: ''}));
-                this.updateUI('outside', 'success', info.ip, info.loc, res.prov, info.cc, info.asn);
+                this.updateUI('outside', 'success', info.ip, info.loc, res.prov, info.cc, info.asn, res.rawTime);
             } catch(e) {
                 this.updateUI('outside', 'error', '', '');
             }
@@ -1719,6 +1797,15 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                             updateProxyRadar(20, 'SPLIT_TUNNEL_SUBNET', \`Egress IP Divergence (\${dom.ip} vs \${ovs.ip})\`, '出口IP漂移：国内与国外出口IP不一致且跨网段但同属同一ASN (疑似透明代理/负载分流)', 'warning');
                         }, 650);
                     }
+                }
+            }
+
+            // [v1.9.46] Core RTT Latency Inversion Check
+            if (dom && ovs && dom.rawTime > 0 && ovs.rawTime > 0) {
+                if (dom.rawTime > 250 && ovs.rawTime < 100) {
+                    setTimeout(() => {
+                        updateProxyRadar(20, 'LATENCY_INVERSION', \`Routing Latency Inversion (Dom:\${dom.rawTime}ms / Ovs:\${ovs.rawTime}ms)\`, '物理延时倒挂：国内节点响应极慢而海外极快 (高度疑似物理位置在海外或使用全局中转代理)', 'warning');
+                    }, 800);
                 }
             }
             
@@ -1805,7 +1892,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         toggleLang(); toggleLang(); 
         refreshProxyRadarUI();
         
-        setTimeout(removePreloader, 3500);
         setTimeout(() => { ClientRouteProber.init(); }, 50);
 
         const fpPromise = Promise.all([
@@ -1922,10 +2008,11 @@ export default {
         };
 
         const clientIp = request.headers.get('cf-connecting-ip') || 'unknown';
+        const ua = request.headers.get('user-agent') || '';
 
-        // 0. Defense Grade WAF active
-        if (!wafCheck(clientIp, ctx)) {
-            return new Response('{"error": "Defense-Grade WAF Active: Rate Limit Exceeded.", "code": 429}', {
+        // 0. Defense Grade WAF active + Rapid Bot Header Pre-flight Checks
+        if (!wafCheck(clientIp, ctx) || ua === '') {
+            return new Response('{"error": "Defense-Grade WAF Active: Rate Limit Exceeded or Invalid Headers.", "code": 429}', {
                 status: 429,
                 headers: { 'Retry-After': '60', 'Content-Type': 'application/json' }
             });
@@ -2000,7 +2087,6 @@ export default {
             serverRiskFactors.push({c: 'Network', en: 'Known Proxy/VPN/Tor in DB (+40)', zh: '威胁情报标记为已知代理节点 (+40)', s: 40});
         }
         
-        const ua = request.headers.get('user-agent') || '';
         if (ua.includes('Headless')) {
             serverNetScore += 50;
             serverRiskFactors.push({c: 'Browser', en: 'Headless Browser UA (+50)', zh: '无头浏览器 User-Agent (+50)', s: 50});
@@ -2070,11 +2156,12 @@ export default {
             '__JSON_DETECTED_IPS__': JSON.stringify(allDetectedIps),
             '__JSON_IP_DETAILS__': JSON.stringify(serverIpDetails),
             '__JSON_RISK_FACTORS__': JSON.stringify(serverRiskFactors),
-            '__JSON_RADAR_SCORE__': JSON.stringify(proxyRadar.score)
+            '__JSON_RADAR_SCORE__': JSON.stringify(proxyRadar.score),
+            '__JSON_SERVER_RTT__': JSON.stringify(request.cf?.clientTcpRtt || 0)
         };
 
         const htmlRendered = HTML_TEMPLATE.replace(
-            /__(PROXY_RADAR_MATRIX|RADAR_SCORE|CLIENT_IP|IPV6_BADGE_CLASS|IPV6_TEXT|IP_TYPE_EN|IP_TYPE_ZH|PROXY_BADGE_CLASS|PROXY_TEXT_EN|PROXY_TEXT_ZH|ASN|ISP|RISK_DETAILS|PSEUDO_TLS_STR|PSEUDO_TLS_HASH|HEADERS_COUNT|HEADERS_LIST|JSON_SERVER_CC|JSON_SERVER_TZ|JSON_SERVER_ASN|JSON_DETECTED_IPS|JSON_IP_DETAILS|JSON_RISK_FACTORS|JSON_RADAR_SCORE)__/g,
+            /__(PROXY_RADAR_MATRIX|RADAR_SCORE|CLIENT_IP|IPV6_BADGE_CLASS|IPV6_TEXT|IP_TYPE_EN|IP_TYPE_ZH|PROXY_BADGE_CLASS|PROXY_TEXT_EN|PROXY_TEXT_ZH|ASN|ISP|RISK_DETAILS|PSEUDO_TLS_STR|PSEUDO_TLS_HASH|HEADERS_COUNT|HEADERS_LIST|JSON_SERVER_CC|JSON_SERVER_TZ|JSON_SERVER_ASN|JSON_DETECTED_IPS|JSON_IP_DETAILS|JSON_RISK_FACTORS|JSON_RADAR_SCORE|JSON_SERVER_RTT)__/g,
             match => templateReplacements[match]
         );
 
