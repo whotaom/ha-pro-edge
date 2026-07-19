@@ -2,17 +2,17 @@
  * HTTP Analyzer Pro - Ultimate Merged Edition (Cloudflare Pages Edge Serverless)
  * 自动双语 / 深度真实指纹采集 / 工业级风控检测全面融合版
  * 
- * Version: v1.9.46 (Physical Layer Accuracy & Anti-Spoofing Edition)
+ * Version: v1.9.47 (Build Hotfix & Edge Resilience Edition)
  * Deployment: Cloudflare Workers / Pages (_worker.js)
  * Changelog: 
- * - [v1.9.46] Extreme Proxy Accuracy / L4 TCP RTT Heuristics / TLS-UA Mismatch / Probe Latency Profiling
+ * - [v1.9.47] Fix esbuild JSX compilation error (Escaped template literals in payload)
+ * - [v1.9.46] Extreme Proxy Accuracy / L4 TCP RTT Heuristics / TLS-UA Mismatch
  * - [v1.9.45] Chunked WAF GC / Idle-Frame Scheduler / Deep Proxy SandBox Detection
  */
 
 // ==================== 0. Military-Grade Core (Isolate Edge WAF) ====================
 const wafCache = new Map();
 
-// Optimized Background GC: Chunked execution to prevent V8 main thread blocking during mass CC attacks
 async function cleanupWafBackground() {
     const now = Date.now();
     let deletedCount = 0;
@@ -25,16 +25,13 @@ async function cleanupWafBackground() {
         }
         if (deletedCount >= 1000) break;
     }
-    
-    // Absolute brute-force fallback for extreme bloating
     if (wafCache.size > 10000) wafCache.clear();
 }
 
 function wafCheck(ip, ctx) {
     const now = Date.now();
-    const limit = 150; // Enterprise max requests per minute
+    const limit = 150;
 
-    // Non-blocking WAF eviction via ctx.waitUntil (Offloaded to Edge microtasks)
     if (wafCache.size > 3000) {
         ctx.waitUntil(cleanupWafBackground());
     }
@@ -49,7 +46,6 @@ function wafCheck(ip, ctx) {
     return record.hits <= limit;
 }
 
-// Crypto hashing for backend (Optimized ArrayBuffer transformation)
 async function sha256(message) {
     const msgBuffer = new TextEncoder().encode(message);
     const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
@@ -80,7 +76,6 @@ function getAllClientIPs(request) {
     let headerSpoofingSuspected = false;
     let proxyHopsDetected = false;
 
-    // Fast loop replacing forEach for V8 optimization
     for (let i = 0; i < ipSources.length; i++) {
         const header = ipSources[i][0];
         const value = ipSources[i][1];
@@ -107,8 +102,6 @@ function getAllClientIPs(request) {
                 if (!allIPs[header]) allIPs[header] = [];
                 allIPs[header].push(ip);
                 
-                // CF Edge Adaptation: Ignore exact match with CF-Connecting-IP
-                // If any IP in the chain differs from the real IP, there is an external proxy hop before CF.
                 if (ip !== realClientIP) {
                     proxyHopsDetected = true;
                 }
@@ -116,7 +109,6 @@ function getAllClientIPs(request) {
         }
     }
 
-    // Detect if CF-Connecting-IP is missing but X-Forwarded-For exists (Edge Gateway Spoofing)
     if (!headers.has('cf-connecting-ip') && headers.has('x-forwarded-for')) {
         headerSpoofingSuspected = true;
     }
@@ -131,7 +123,6 @@ function getAllClientIPs(request) {
 }
 
 function detectAdvancedProxy(request) {
-    // Exclude standard CF Headers, rigorously expanded for cloud/microservices leak detection (v1.9.46)
     const proxyHeaders = [
         'via', 'proxy-connection', 'x-proxy-id', 'surrogate-capability', 
         'x-bluecoat-via', 'x-squid-error', 'x-proxyuser-ip', 'x-arr-log-id', 
@@ -170,7 +161,6 @@ async function getIpContextClassification(ip, cfData, ctx) {
 
     if (!response) {
         try {
-            // Hard timeout via AbortSignal to guarantee Edge TTFB
             response = await fetch(cacheKey, { 
                 cf: { cacheTtl: 86400 },
                 signal: AbortSignal.timeout(300) 
@@ -179,7 +169,7 @@ async function getIpContextClassification(ip, cfData, ctx) {
                 ctx.waitUntil(cache.put(cacheKey, response.clone()));
             }
         } catch (e) {
-            response = null; // Graceful degradation to cfData
+            response = null; 
         }
     }
 
@@ -230,7 +220,6 @@ function evaluateProxyRiskMatrix(ipInfo, advancedProxies, ipContext, request) {
     
     let score = 0;
 
-    // Smart Gateway Exemption Logic for CF Pages
     if (ipInfo.is_header_spoofed) {
         dimensions['headers'] = {level: 'danger', en: 'CRITICAL: Header Spoofing / Untrusted Gateway', zh: '高危：检测到边缘节点请求源伪造 (非受信网关透传)'};
         score += 55;
@@ -261,14 +250,12 @@ function evaluateProxyRiskMatrix(ipInfo, advancedProxies, ipContext, request) {
         score += 20;
     }
 
-    // [v1.9.46] Physical Layer RTT Anomaly Detection (Defeats L7 spoofers)
     const tcpRtt = request.cf?.clientTcpRtt || 0;
     if (tcpRtt > 0 && tcpRtt <= 15 && !ipContext.is_datacenter && (ipContext.is_mobile || ipContext.type.includes('Residential'))) {
         dimensions['rtt'] = {level: 'warning', en: 'L4 TCP RTT Anomaly (Proxy Tunnel)', zh: '延时异动：家庭/移动网络测得极低底层TCP RTT(疑似同城代理中转)'};
         score += 25;
     }
 
-    // [v1.9.46] TLS vs User-Agent Mismatch Heuristics
     const tlsVersion = request.cf?.tlsVersion || '';
     const ua = request.headers.get('user-agent') || '';
     if (tlsVersion === 'TLSv1.2' && /Chrome\/(1[1-9][0-9]|2[0-9]{2})/.test(ua) && !ua.includes('Mobile')) {
@@ -279,7 +266,6 @@ function evaluateProxyRiskMatrix(ipInfo, advancedProxies, ipContext, request) {
     return { score: Math.min(score, 100), matrix: dimensions };
 }
 
-// Escaper helper (Optimized Dictionary RegExp mapping)
 const escapeHTML = (str) => {
     if (!str) return '';
     const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' };
@@ -287,14 +273,12 @@ const escapeHTML = (str) => {
 };
 
 // ==================== EDGE HTML TEMPLATE ====================
-// Utilizing safe replacement tokens to guarantee 100% downstream JS compatibility
 const HTML_TEMPLATE = `<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HTTP Analyzer</title>
-    <!-- Resource Hint & Preload Optimizations (v1.9.46 Edge) -->
     <link rel="preconnect" href="https://cdn.tailwindcss.com" crossorigin>
     <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
     <link rel="dns-prefetch" href="https://cdn.tailwindcss.com">
@@ -601,9 +585,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         }
     };
     
-    // Ensure Preloader doesn't permanently lock screen on weak network
     window.addEventListener('load', removePreloader);
-    setTimeout(removePreloader, 4000); // 4s ultimate fallback
+    setTimeout(removePreloader, 4000); 
 
     const P_CLIENT_IP = document.getElementById('main-client-ip').innerText;
     const SERVER_CC = __JSON_SERVER_CC__;
@@ -612,7 +595,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     const SERVER_DETECTED_IPS = __JSON_DETECTED_IPS__;
     const SERVER_IP_DETAILS = __JSON_IP_DETAILS__;
     const SERVER_BASE_RISK_FACTORS = __JSON_RISK_FACTORS__;
-    const SERVER_RTT = parseInt(__JSON_SERVER_RTT__); // [v1.9.46] Physical Layer TCP RTT
+    const SERVER_RTT = parseInt(__JSON_SERVER_RTT__); 
     
     let globalRadarScore = parseInt(__JSON_RADAR_SCORE__);
     
@@ -624,7 +607,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
     const escapeHTML = str => { if (!str) return ''; const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }; return String(str).replace(/[&<>'"]/g, m => map[m]); };
     
-    // Idle Frame Scheduler to prevent UI locking during heavy biometrics processing
     const executeAsync = (fn) => new Promise(resolve => {
         const wrap = () => { try { resolve(fn()); } catch(e) { resolve('Blocked'); } };
         if (window.requestIdleCallback) requestIdleCallback(wrap, { timeout: 1500 });
@@ -1218,14 +1200,14 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             "<span class='text-red-400'><span class='en-only'>Enabled</span><span class='zh-only'>已开启代理压缩</span></span>" : 
             "<span class='en-only'>Disabled</span><span class='zh-only'>未启用</span>";
             
-        // [v1.9.46] Physical TCP RTT vs Application RTT Logic
+        // [v1.9.46/v1.9.47] Physical TCP RTT vs Application RTT Logic (Escaped properly)
         let rttHtml = conn ? conn.rtt + ' ms (L7 App)' : "Unknown";
         if (SERVER_RTT > 0) {
             let rttClass = "text-sky-400";
             if (conn && conn.rtt && Math.abs(conn.rtt - SERVER_RTT) >= 150) {
-                rttClass = "text-red-400 font-bold"; // High differential indicates likely proxy tunneling
+                rttClass = "text-red-400 font-bold";
             }
-            rttHtml += ` / <span class="${rttClass}" title="Server Layer-4 TCP Round Trip Time">L4 TCP: ${SERVER_RTT} ms</span>`;
+            rttHtml += \` / <span class="\${rttClass}" title="Server Layer-4 TCP Round Trip Time">L4 TCP: \${SERVER_RTT} ms</span>\`;
         }
 
         return {
@@ -1299,7 +1281,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             apiIpMatch = \`<span class='text-slate-500'><span class="en-only">Blocked / Unavailable</span><span class="zh-only">接口阻断 / 无数据</span></span>\`;
         }
 
-        // Tri-Point Geo Consensus Logic
         const validCcs = validApis.map(a => a.cc).filter(Boolean);
         let uniqueCcs = [...new Set(validCcs)];
         
@@ -1348,7 +1329,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(uaGlobal);
         const isAppleDevice = /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
 
-        // Advanced Proxy Object / Navigator override detection
         try { if (Object.getOwnPropertyNames(navigator).includes('webdriver')) addRisk("Behavior", "WebDriver Property Override", "原生 WebDriver 属性被强制覆盖保护", 40); } catch(e){}
 
         if (checkNativeTampering(Navigator.prototype, 'webdriver')) {
@@ -1800,7 +1780,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                 }
             }
 
-            // [v1.9.46] Core RTT Latency Inversion Check
             if (dom && ovs && dom.rawTime > 0 && ovs.rawTime > 0) {
                 if (dom.rawTime > 250 && ovs.rawTime < 100) {
                     setTimeout(() => {
@@ -2065,7 +2044,7 @@ export default {
             serverNetScore += 55;
             serverRiskFactors.push({c: 'Network', en: 'Untrusted Gateway Headers Spoofed (+55)', zh: '非可信网关注入代理头/源IP伪造 (+55)', s: 55});
         }
-        // Specific Proxy Hops evaluation (CF Exempted)
+        
         if (ipInfo.proxy_hops) {
             serverNetScore += 10;
             serverRiskFactors.push({c: 'Network', en: 'X-Forwarded-For Multi-Hop Detected (+10)', zh: '检测到 X-Forwarded-For 多层代理转发 (+10)', s: 10});
