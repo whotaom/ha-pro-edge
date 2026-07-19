@@ -2,12 +2,12 @@
  * HTTP Analyzer Pro - Ultimate Merged Edition (Cloudflare Pages Edge Serverless)
  * 自动双语 / 深度真实指纹采集 / 工业级风控检测全面融合版
  * 
- * Version: v1.9.47 (Build Hotfix & Edge Resilience Edition)
+ * Version: v1.9.48 (Extreme Routing Precision & Deep PAC Correlation Edition)
  * Deployment: Cloudflare Workers / Pages (_worker.js)
  * Changelog: 
- * - [v1.9.47] Fix esbuild JSX compilation error (Escaped template literals in payload)
+ * - [v1.9.48] Extreme Split-Tunneling Accuracy / Bilibili & Sohu Probes / PAC Correlation Heuristics
+ * - [v1.9.47] Build Hotfix (React JSX parse error prevention in esbuild)
  * - [v1.9.46] Extreme Proxy Accuracy / L4 TCP RTT Heuristics / TLS-UA Mismatch
- * - [v1.9.45] Chunked WAF GC / Idle-Frame Scheduler / Deep Proxy SandBox Detection
  */
 
 // ==================== 0. Military-Grade Core (Isolate Edge WAF) ====================
@@ -1200,7 +1200,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             "<span class='text-red-400'><span class='en-only'>Enabled</span><span class='zh-only'>已开启代理压缩</span></span>" : 
             "<span class='en-only'>Disabled</span><span class='zh-only'>未启用</span>";
             
-        // [v1.9.46/v1.9.47] Physical TCP RTT vs Application RTT Logic (Escaped properly)
         let rttHtml = conn ? conn.rtt + ' ms (L7 App)' : "Unknown";
         if (SERVER_RTT > 0) {
             let rttClass = "text-sky-400";
@@ -1605,8 +1604,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             });
         },
 
-        updateUI(id, status, ip, loc, provider='', countryCode='', asn='', rawTime=0) {
-            this.dataMap[id] = { ip: ip, loc: loc, cc: countryCode, asn: asn, rawTime: rawTime };
+        updateUI(id, status, ip, loc, provider='', countryCode='', asn='', rawTime=0, rawData=null) {
+            this.dataMap[id] = { ip: ip, loc: loc, cc: countryCode, asn: asn, rawTime: rawTime, raw: rawData };
             const statusEl = document.getElementById(\`status-\${id}\`);
             const valEl = document.getElementById(\`val-\${id}\`);
             const locEl = document.getElementById(\`loc-\${id}\`);
@@ -1659,10 +1658,12 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                     req('Tencent', this.jsonp('https://vv.video.qq.com/checktime?otype=json', 'callback', 3500)),
                     req('Baidu', this.fetchTimeout('https://qifu-api.baidubce.com/ip/local/geo/v1/district', {}, 3500).then(r=>r.json()).then(d=>d.data)),
                     req('ByteDance', this.fetchTimeout('https://perfops2.byte-test.com/500b-bench.jpg', {method:'HEAD'}, 3500).then(r => ({ip:r.headers.get('X-Request-Ip')}))),
+                    req('Bilibili', this.fetchTimeout('https://api.bilibili.com/x/web-interface/zone', {}, 3500).then(r=>r.json()).then(d=>({ip:d.data?.ip}))),
+                    req('Sohu', this.fetchTimeout('https://pv.sohu.com/cityjson?ie=utf-8', {}, 3500).then(r=>r.text()).then(t=>{const m=t.match(/"cip":\\s*"([^"]+)"/); return {ip:m?m[1]:null}})),
                     req('PConline', this.jsonp('https://whois.pconline.com.cn/ipJson.jsp', 'callback', 3500))
                 ]);
-                const info = await this.getIpInfo(res.ip);
-                this.updateUI('ipip', 'success', info.ip, info.loc, res.prov, info.cc, info.asn, res.rawTime);
+                const info = await this.getIpInfo(res.ip).catch(() => ({ip: res.ip, loc: 'Unknown', cc: '', asn: '', raw: {}}));
+                this.updateUI('ipip', 'success', info.ip, info.loc, res.prov, info.cc, info.asn, res.rawTime, info.raw);
             } catch(e) {
                 this.updateUI('ipip', 'error', '', '');
             }
@@ -1680,12 +1681,13 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                 });
                 const res = await Promise.any([
                     req('ipapi', this.fetchTimeout('https://api.ipapi.is', {}, 3500).then(r=>r.json()).then(d=>({ip:d.ip, cc:d.location?.country_code, asn:d.asn?.asn?\`AS\${d.asn.asn}\`:'', org:d.company?.name}))),
-                    req('cmliussss', this.fetchTimeout('https://api.cmliussss.net/api/ipinfo', {}, 3500).then(r=>r.json()).then(d=>({ip:d.ip, cc:d.country_code, asn:d.asn?.replace('AS','')?\`AS\${d.asn.replace('AS','')}\`:'', org:d.as_name}))),
                     req('IPinfo', this.fetchTimeout('https://ipinfo.io/json', {}, 3500).then(r=>r.json()).then(d=>({ip:d.ip, cc:d.country, asn:d.org?d.org.split(' ')[0]:'', org:d.org?d.org.substring(d.org.indexOf(' ')+1):''}))),
-                    req('Ifconfig', this.fetchTimeout('https://ifconfig.co/json', {}, 3500).then(r=>r.json()).then(d=>({ip:d.ip, cc:d.country_iso, asn:d.asn?\`AS\${d.asn}\`:'', org:d.asn_org})))
+                    req('Ifconfig', this.fetchTimeout('https://ifconfig.co/json', {}, 3500).then(r=>r.json()).then(d=>({ip:d.ip, cc:d.country_iso, asn:d.asn?\`AS\${d.asn}\`:'', org:d.asn_org}))),
+                    req('MyIP', this.fetchTimeout('https://api.myip.com', {}, 3500).then(r=>r.json()).then(d=>({ip:d.ip, cc:d.cc, asn:'', org:''})))
                 ]);
                 const loc = \`\${res.cc || ''} \${res.asn || ''} \${res.org || ''}\`.trim();
-                this.updateUI('overseas', 'success', res.ip, loc, res.prov, res.cc, res.asn, res.rawTime);
+                const info = await this.getIpInfo(res.ip).catch(() => ({ip: res.ip, loc: loc, cc: res.cc, asn: res.asn, raw: {}}));
+                this.updateUI('overseas', 'success', info.ip, info.loc, res.prov, info.cc, info.asn, res.rawTime, info.raw);
             } catch(e) {
                 this.updateUI('overseas', 'error', '', '');
             }
@@ -1707,8 +1709,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                     })),
                     req('CF v4 API', this.fetchTimeout('https://ipv4.090227.xyz').then(r=>r.json()).then(d=>({ip:d.ip, cc:d.country})))
                 ]);
-                const info = await this.getIpInfo(res.ip).catch(() => ({ip: res.ip, loc: res.cc, cc: res.cc, asn: ''}));
-                this.updateUI('cf', 'success', info.ip, info.loc, res.prov, info.cc, info.asn, res.rawTime);
+                const info = await this.getIpInfo(res.ip).catch(() => ({ip: res.ip, loc: res.cc, cc: res.cc, asn: '', raw: {}}));
+                this.updateUI('cf', 'success', info.ip, info.loc, res.prov, info.cc, info.asn, res.rawTime, info.raw);
             } catch(e) {
                 this.updateUI('cf', 'error', '', '');
             }
@@ -1730,8 +1732,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                     })),
                     req('Google', this.jsonp('https://jsonp-ip.appspot.com/', 'callback', 3500))
                 ]);
-                const info = await this.getIpInfo(res.ip).catch(() => ({ip: res.ip, loc: 'Unknown', cc: '', asn: ''}));
-                this.updateUI('outside', 'success', info.ip, info.loc, res.prov, info.cc, info.asn, res.rawTime);
+                const info = await this.getIpInfo(res.ip).catch(() => ({ip: res.ip, loc: 'Unknown', cc: '', asn: '', raw: {}}));
+                this.updateUI('outside', 'success', info.ip, info.loc, res.prov, info.cc, info.asn, res.rawTime, info.raw);
             } catch(e) {
                 this.updateUI('outside', 'error', '', '');
             }
@@ -1747,17 +1749,32 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             
             const dom = this.dataMap['ipip'];
             const ovs = this.dataMap['overseas'];
+            const serverIps = SERVER_DETECTED_IPS || [];
             
             if (dom && ovs && dom.ip && ovs.ip) {
+                const isV4 = (ip) => ip.includes('.');
+                const isV6 = (ip) => ip.includes(':');
+                
                 if (dom.ip !== ovs.ip) {
-                    const isV4 = (ip) => ip.includes('.');
-                    const isV6 = (ip) => ip.includes(':');
-                    
                     let networkMismatch = false;
                     
                     if ((isV4(dom.ip) && isV4(ovs.ip)) || (isV6(dom.ip) && isV6(ovs.ip))) {
                         if (!isSameSubnet(dom.ip, ovs.ip)) {
                             networkMismatch = true;
+                        }
+                        
+                        // [v1.9.48] Deep PAC Correlation Detection
+                        const domMatchesServer = serverIps.includes(dom.ip) || serverIps.some(sIp => isSameSubnet(dom.ip, sIp));
+                        const ovsMatchesServer = serverIps.includes(ovs.ip) || serverIps.some(sIp => isSameSubnet(ovs.ip, sIp));
+                        
+                        if (domMatchesServer && !ovsMatchesServer) {
+                            setTimeout(() => {
+                                updateProxyRadar(40, 'PAC_RULE_A', \`Route Target: Dom \u2192 Server, Ovs \u2192 Proxy\`, '精准分流探测：国内测速点与本站直连，海外测速点绕行节点 (确认为规则分流代理)', 'danger');
+                            }, 850);
+                        } else if (!domMatchesServer && ovsMatchesServer) {
+                            setTimeout(() => {
+                                updateProxyRadar(40, 'PAC_RULE_B', \`Route Target: Ovs \u2192 Server, Dom \u2192 Direct\`, '精准分流探测：海外测速点与本站经由代理，国内测速点直连绕过 (确认为规则分流代理)', 'danger');
+                            }, 850);
                         }
                     } else {
                         if (dom.cc && ovs.cc && dom.cc !== ovs.cc) {
@@ -1780,8 +1797,16 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                 }
             }
 
+            // [v1.9.48] Domestic Egress Datacenter Anomaly
+            if (dom && dom.raw && dom.raw.is_datacenter && dom.cc === 'CN') {
+                setTimeout(() => {
+                    updateProxyRadar(20, 'DOM_DATACENTER_PROXY', \`Domestic Egress \u2192 Datacenter\`, '国内出口异常：国内探测流量经由数据中心/云厂商中转 (疑似国内跳板机/代理软路由)', 'warning');
+                }, 900);
+            }
+
+            // [v1.9.48] Latency Inversion Enhanced Check
             if (dom && ovs && dom.rawTime > 0 && ovs.rawTime > 0) {
-                if (dom.rawTime > 250 && ovs.rawTime < 100) {
+                if (dom.rawTime > 300 && ovs.rawTime < 150) {
                     setTimeout(() => {
                         updateProxyRadar(20, 'LATENCY_INVERSION', \`Routing Latency Inversion (Dom:\${dom.rawTime}ms / Ovs:\${ovs.rawTime}ms)\`, '物理延时倒挂：国内节点响应极慢而海外极快 (高度疑似物理位置在海外或使用全局中转代理)', 'warning');
                     }, 800);
